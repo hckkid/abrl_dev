@@ -5,3 +5,7 @@ version = 4
 [[package]]
 name = "abrl_minimal"
 version = "0.1.0"
+
+[[package]]
+name = "actor_store"
+version = "0.1.0"

@@ -1,5 +1,5 @@
 [workspace]
 members = [
     "stages/abrl_minimal"
-]
+, "stages/actor_store"]
 resolver = "2"
