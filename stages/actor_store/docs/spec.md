@@ -128,7 +128,7 @@ The client provides the public-facing API for applications. Similar to MongoDB c
 **Key Characteristics:**
 - Thread-safe (can be cloned and shared across threads)
 - Requires `actor_type` parameter (similar to collection/table name)
-- No need for `&mut self` (interior mutability handled internally)
+- Client should work with either self(if Copy Trait is implemented) or read reference(&T) for public API.
 - Returns results immediately
 
 ### 2. ActorStore (Server/Handler)
@@ -160,6 +160,7 @@ Separate module responsible for event sequencing, storage, and distribution.
 - **CdcWriter**: Lightweight handle for publishing events (used by ActorStore)
 - **CdcLog**: Manages event log, replay buffer, and subscriptions
 - **Background Processor**: Sequences events, maintains replay buffer, broadcasts to subscribers
+  - We might make it pull based similar to kafka, a consumer can ask for offset, and it may ask for batch of events from an offset.
 
 **Design Benefits:**
 - **Separation of concerns**: CDC logic independent of storage
