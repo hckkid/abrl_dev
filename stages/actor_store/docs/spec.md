@@ -35,6 +35,8 @@ Actor Store is a distributed, Redis-like key-value store specifically designed f
 ### Key Characteristics
 
 - **Storage Model**: Key-Value with JSON values
+- **Atomicity**: Single-operation atomicity; multi-entity transactions in future phases
+- **Isolation**: Per-key serializability; leader reads are linearizable
 - **Consistency**: Strong consistency through leader-based replication
 - **Durability**: Write-ahead logging with configurable persistence
 - **Scalability**: Horizontal scaling through consistent hashing
@@ -57,7 +59,7 @@ pub struct ActorData {
     pub value: serde_json::Value,
 
     /// Monotonically increasing version counter
-    /// Starts at 1 on insert, increments on every update
+    /// Starts at 0 on insert, increments on every update
     pub version: u64,
 }
 ```
@@ -65,20 +67,20 @@ pub struct ActorData {
 ### Key Constraints
 
 **Key (id field)**:
-- Type: `String` or `ObjectID` (ObjectID will be implemented later)
+- Type: `String` (to be generalised to arbitrary types implementing `Eq` and `Hash` in future, this type can vary per Actor in future)
 - Must be non-empty
 - Must be valid UTF-8
 - Recommended max length: 512 bytes
 - Similar to Redis keys (not UUID-based ObjectID)
 - Keys must implement `Eq`, `Hash` traits for HashMap/DashMap based implementation.
-- Cannot be changed post creation of Actor for now.
+- **Immutability**: Cannot be changed post creation of Actor for now.
 
 **Value (value field)**:
 - Type: `serde_json::Value`
 - Can be any valid JSON: object, array, string, number, boolean, null
 - No schema enforcement (schema-less storage)
 - Recommended max size: 10 MB per value
-- Stored as serialized bytes internally
+- Stored in compact(non-pretty/uglified) JSON format for storage efficiency when writing to disk for persistence.
 
 **Version (version field)**:
 - Type: `u64`
@@ -91,19 +93,19 @@ pub struct ActorData {
 
 ```json
 {
-  "id": "user:12345",
+  "id": "user-12345",
   "value": {
     "name": "Alice",
     "email": "alice@example.com",
     "balance": 1000.50
   },
-  "version": 1
+  "version": 0
 }
 ```
 
 ```json
 {
-  "id": "order:order-abc-123",
+  "id": "order-abc-123",
   "value": {
     "items": ["item1", "item2"],
     "total": 299.99,
@@ -115,67 +117,707 @@ pub struct ActorData {
 
 ---
 
+## Architecture Components
+
+The Actor Store is composed of three main components that work together:
+
+### 1. ActorStoreClient (Public API)
+
+The client provides the public-facing API for applications. Similar to MongoDB client or Redis client, it abstracts the internal storage mechanism and provides a clean interface for CRUD operations.
+
+**Key Characteristics:**
+- Thread-safe (can be cloned and shared across threads)
+- Requires `actor_type` parameter (similar to collection/table name)
+- No need for `&mut self` (interior mutability handled internally)
+- Returns results immediately
+
+### 2. ActorStore (Server/Handler)
+
+The internal storage engine that processes commands and manages data.
+
+**Architecture:**
+```rust
+pub struct ActorStore {
+    // Nested DashMap: actor_type -> (actor_id -> ActorData)
+    data: DashMap<String, DashMap<String, ActorData>>,
+
+    // CDC writer handle (lock-free)
+    cdc_writer: CdcWriter,
+}
+```
+
+**Design Benefits:**
+- **Lock-free concurrency**: Different actor types have zero contention
+- **Per-key isolation**: Operations on different keys within same type are concurrent
+- **Interior mutability**: DashMap provides lock-free read/write access
+- **Minimal contention**: Only serialization point is per-key within DashMap
+
+### 3. CDC Module (Change Data Capture)
+
+Separate module responsible for event sequencing, storage, and distribution.
+
+**Components:**
+- **CdcWriter**: Lightweight handle for publishing events (used by ActorStore)
+- **CdcLog**: Manages event log, replay buffer, and subscriptions
+- **Background Processor**: Sequences events, maintains replay buffer, broadcasts to subscribers
+
+**Design Benefits:**
+- **Separation of concerns**: CDC logic independent of storage
+- **Lock-free publishing**: Writers use lock-free channel
+- **Resume capability**: Replay buffer supports subscription resume
+- **Phase 2 ready**: Easy to add disk persistence (WAL)
+
+---
+
+## Detailed Component Design
+
+### Component 1: ActorStoreClient (Public API)
+
+```rust
+use serde_json::Value;
+use std::sync::Arc;
+
+/// Public-facing client for Actor Store operations
+#[derive(Clone)]
+pub struct ActorStoreClient {
+    store: Arc<ActorStore>,
+    cdc_log: Arc<CdcLog>,
+}
+
+impl ActorStoreClient {
+    /// Create a new client with default configuration
+    pub fn new() -> Self {
+        Self::with_config(ActorStoreConfig::default())
+    }
+
+    /// Create a new client with custom configuration
+    pub fn with_config(config: ActorStoreConfig) -> Self {
+        let (cdc_writer, cdc_log) = create_cdc_log(config.cdc_config);
+
+        let store = Arc::new(ActorStore {
+            data: DashMap::new(),
+            cdc_writer,
+        });
+
+        Self {
+            store,
+            cdc_log: Arc::new(cdc_log),
+        }
+    }
+
+    /// Insert a new actor
+    pub fn insert(
+        &self,
+        actor_type: impl Into<String>,
+        id: impl Into<String>,
+        value: Value,
+    ) -> Result<ActorData, InsertError> {
+        self.store.insert(actor_type.into(), id.into(), value)
+    }
+
+    /// Get an actor by ID
+    pub fn get(
+        &self,
+        actor_type: impl Into<String>,
+        id: &str,
+    ) -> Option<ActorData> {
+        self.store.get(actor_type.into(), id)
+    }
+
+    /// Update an existing actor
+    pub fn update(
+        &self,
+        actor_type: impl Into<String>,
+        id: &str,
+        value: Value,
+    ) -> Result<ActorData, UpdateError> {
+        self.store.update(actor_type.into(), id, value)
+    }
+
+    /// Update with version check (compare-and-swap)
+    pub fn update_versioned(
+        &self,
+        actor_type: impl Into<String>,
+        id: &str,
+        value: Value,
+        expected_version: u64,
+    ) -> Result<ActorData, UpdateVersionedError> {
+        self.store.update_versioned(actor_type.into(), id, value, expected_version)
+    }
+
+    /// Delete an actor
+    pub fn delete(
+        &self,
+        actor_type: impl Into<String>,
+        id: &str,
+    ) -> Option<ActorData> {
+        self.store.delete(actor_type.into(), id)
+    }
+
+    /// Get all actors of a specific type
+    pub fn get_all(
+        &self,
+        actor_type: impl Into<String>,
+    ) -> Vec<ActorData> {
+        self.store.get_all(actor_type.into())
+    }
+
+    /// Subscribe to change events
+    pub fn subscribe(
+        &self,
+        options: SubscriptionOptions,
+    ) -> Result<CdcSubscription, CdcError> {
+        self.cdc_log.subscribe(options)
+    }
+
+    /// Get CDC statistics
+    pub fn cdc_stats(&self) -> CdcStats {
+        self.cdc_log.stats()
+    }
+}
+
+pub struct ActorStoreConfig {
+    pub cdc_config: CdcConfig,
+    // Future: persistence config, cluster config, etc.
+}
+```
+
+---
+
+### Component 2: ActorStore (Server/Handler)
+
+```rust
+use dashmap::DashMap;
+
+/// Internal storage handler with nested DashMap architecture
+pub struct ActorStore {
+    // actor_type -> (actor_id -> ActorData)
+    data: DashMap<String, DashMap<String, ActorData>>,
+
+    // CDC writer (lock-free, cloneable)
+    cdc_writer: CdcWriter,
+}
+
+impl ActorStore {
+    /// Insert operation implementation
+    pub fn insert(
+        &self,
+        actor_type: String,
+        id: String,
+        value: Value,
+    ) -> Result<ActorData, InsertError> {
+        // Validate inputs
+        if id.is_empty() {
+            return Err(InsertError::InvalidKey);
+        }
+
+        // Create ActorData
+        let actor = ActorData {
+            id: id.clone(),
+            value: value.clone(),
+            version: 0,
+        };
+
+        // Get or create inner DashMap for actor type
+        let type_store = self.data
+            .entry(actor_type.clone())
+            .or_insert_with(DashMap::new);
+
+        // Attempt insert (fails if key exists)
+        if type_store.insert(id.clone(), actor.clone()).is_some() {
+            return Err(InsertError::KeyAlreadyExists);
+        }
+
+        // Publish CDC event (lock-free, returns sequence number)
+        let seq = self.cdc_writer.write(UnsequencedEvent {
+            operation: OperationType::INSERT,
+            actor_type,
+            actor_id: id,
+            previous_value: None,
+            previous_version: None,
+            new_value: Some(value),
+            new_version: Some(0),
+            timestamp: Utc::now(),
+        })?;
+
+        Ok(actor)
+    }
+
+    /// Get operation implementation
+    pub fn get(
+        &self,
+        actor_type: String,
+        id: &str,
+    ) -> Option<ActorData> {
+        self.data
+            .get(&actor_type)?
+            .get(id)
+            .map(|entry| entry.value().clone())
+    }
+
+    /// Update operation implementation
+    pub fn update(
+        &self,
+        actor_type: String,
+        id: &str,
+        value: Value,
+    ) -> Result<ActorData, UpdateError> {
+        let type_store = self.data
+            .get(&actor_type)
+            .ok_or(UpdateError::NotFound)?;
+
+        let mut entry = type_store
+            .get_mut(id)
+            .ok_or(UpdateError::NotFound)?;
+
+        let old_value = entry.value.clone();
+        let old_version = entry.version;
+
+        // Update in place
+        entry.value = value.clone();
+        entry.version += 1;
+
+        let updated = entry.clone();
+        drop(entry); // Release lock
+
+        // Publish CDC event
+        let seq = self.cdc_writer.write(UnsequencedEvent {
+            operation: OperationType::UPDATE,
+            actor_type,
+            actor_id: id.to_string(),
+            previous_value: Some(old_value),
+            previous_version: Some(old_version),
+            new_value: Some(value),
+            new_version: Some(updated.version),
+            timestamp: Utc::now(),
+        })?;
+
+        Ok(updated)
+    }
+
+    /// Update with version check implementation
+    pub fn update_versioned(
+        &self,
+        actor_type: String,
+        id: &str,
+        value: Value,
+        expected_version: u64,
+    ) -> Result<ActorData, UpdateVersionedError> {
+        let type_store = self.data
+            .get(&actor_type)
+            .ok_or(UpdateVersionedError::NotFound)?;
+
+        let mut entry = type_store
+            .get_mut(id)
+            .ok_or(UpdateVersionedError::NotFound)?;
+
+        // Version check
+        if entry.version != expected_version {
+            return Err(UpdateVersionedError::VersionMismatch {
+                expected: expected_version,
+                actual: entry.version,
+            });
+        }
+
+        let old_value = entry.value.clone();
+        let old_version = entry.version;
+
+        // Update in place
+        entry.value = value.clone();
+        entry.version += 1;
+
+        let updated = entry.clone();
+        drop(entry); // Release lock
+
+        // Publish CDC event
+        let seq = self.cdc_writer.write(UnsequencedEvent {
+            operation: OperationType::UPDATE,
+            actor_type,
+            actor_id: id.to_string(),
+            previous_value: Some(old_value),
+            previous_version: Some(old_version),
+            new_value: Some(value),
+            new_version: Some(updated.version),
+            timestamp: Utc::now(),
+        })?;
+
+        Ok(updated)
+    }
+
+    /// Delete operation implementation
+    pub fn delete(
+        &self,
+        actor_type: String,
+        id: &str,
+    ) -> Option<ActorData> {
+        let type_store = self.data.get(&actor_type)?;
+        let (_, deleted) = type_store.remove(id)?;
+
+        // Publish CDC event
+        let _ = self.cdc_writer.write(UnsequencedEvent {
+            operation: OperationType::DELETE,
+            actor_type,
+            actor_id: id.to_string(),
+            previous_value: Some(deleted.value.clone()),
+            previous_version: Some(deleted.version),
+            new_value: None,
+            new_version: None,
+            timestamp: Utc::now(),
+        });
+
+        Some(deleted)
+    }
+
+    /// Get all actors of a specific type
+    pub fn get_all(
+        &self,
+        actor_type: String,
+    ) -> Vec<ActorData> {
+        self.data
+            .get(&actor_type)
+            .map(|type_store| {
+                type_store.iter()
+                    .map(|entry| entry.value().clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+```
+
+---
+
+### Component 3: CDC Module
+
+```rust
+use crossbeam::channel::{bounded, Sender, Receiver};
+use crossbeam::queue::ArrayQueue;
+use tokio::sync::broadcast;
+
+/// Configuration for CDC
+pub struct CdcConfig {
+    pub replay_buffer_size: usize,      // e.g., 10_000
+    pub channel_capacity: usize,        // e.g., 10_000
+    pub subscriber_capacity: usize,     // e.g., 1_000
+    pub persistence_path: Option<PathBuf>,  // Phase 2
+}
+
+/// Creates a CDC log system (similar to mpsc::channel pattern)
+pub fn create_cdc_log(config: CdcConfig) -> (CdcWriter, CdcLog) {
+    let (sender, receiver) = bounded(config.channel_capacity);
+    let replay_buffer = ArrayQueue::new(config.replay_buffer_size);
+    let (broadcast_tx, _) = broadcast::channel(config.subscriber_capacity);
+
+    let sequence = Arc::new(AtomicU64::new(0));
+
+    let inner = Arc::new(CdcLogInner {
+        sequence: sequence.clone(),
+        receiver,
+        replay_buffer,
+        broadcast_tx: broadcast_tx.clone(),
+        config,
+        stats: Arc::new(AtomicStats::default()),
+    });
+
+    // Spawn background processor
+    let inner_clone = inner.clone();
+    let processor_handle = std::thread::Builder::new()
+        .name("cdc-processor".to_string())
+        .spawn(move || cdc_processor_loop(inner_clone))
+        .expect("Failed to spawn CDC processor");
+
+    let writer = CdcWriter {
+        sender,
+        sequence,
+    };
+
+    let cdc_log = CdcLog {
+        inner,
+        processor_handle: Some(processor_handle),
+    };
+
+    (writer, cdc_log)
+}
+
+/// CdcWriter - Lightweight, cloneable handle for publishing events
+#[derive(Clone)]
+pub struct CdcWriter {
+    sender: Sender<ChangeEvent>,
+    sequence: Arc<AtomicU64>,
+}
+
+impl CdcWriter {
+    /// Write an event (returns actual sequence number)
+    pub fn write(&self, event: UnsequencedEvent) -> Result<u64, CdcError> {
+        // Pre-allocate sequence number (lock-free, instant)
+        let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
+
+        // Create sequenced event
+        let sequenced = ChangeEvent {
+            sequence: seq,
+            operation: event.operation,
+            actor_type: event.actor_type,
+            actor_id: event.actor_id,
+            previous_value: event.previous_value,
+            previous_version: event.previous_version,
+            new_value: event.new_value,
+            new_version: event.new_version,
+            timestamp: event.timestamp,
+        };
+
+        // Enqueue for background processing
+        self.sender.send(sequenced)
+            .map_err(|_| CdcError::Disconnected)?;
+
+        Ok(seq)
+    }
+}
+
+/// Event before sequencing (created by ActorStore)
+pub struct UnsequencedEvent {
+    pub operation: OperationType,
+    pub actor_type: String,
+    pub actor_id: String,
+    pub previous_value: Option<Value>,
+    pub previous_version: Option<u64>,
+    pub new_value: Option<Value>,
+    pub new_version: Option<u64>,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Sequenced event (after CDC processing)
+pub struct ChangeEvent {
+    pub sequence: u64,  // Assigned before enqueue
+    pub operation: OperationType,
+    pub actor_type: String,
+    pub actor_id: String,
+    pub previous_value: Option<Value>,
+    pub previous_version: Option<u64>,
+    pub new_value: Option<Value>,
+    pub new_version: Option<u64>,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// CdcLog - Manages subscriptions and event log
+pub struct CdcLog {
+    inner: Arc<CdcLogInner>,
+    processor_handle: Option<JoinHandle<()>>,
+}
+
+struct CdcLogInner {
+    sequence: Arc<AtomicU64>,
+    receiver: Receiver<ChangeEvent>,
+    replay_buffer: ArrayQueue<ChangeEvent>,
+    broadcast_tx: broadcast::Sender<ChangeEvent>,
+    config: CdcConfig,
+    stats: Arc<AtomicStats>,
+}
+
+impl CdcLog {
+    /// Subscribe to change events
+    pub fn subscribe(
+        &self,
+        options: SubscriptionOptions,
+    ) -> Result<CdcSubscription, CdcError> {
+        let receiver = self.inner.broadcast_tx.subscribe();
+
+        // TODO: Handle replay for Beginning/SequenceNumber positions
+
+        self.inner.stats.active_subscriptions
+            .fetch_add(1, Ordering::Relaxed);
+
+        Ok(CdcSubscription {
+            receiver,
+            filter: SubscriptionFilter {
+                actor_type: options.actor_type_filter,
+                key_prefix: options.key_prefix_filter,
+            },
+        })
+    }
+
+    /// Get current sequence number
+    pub fn current_sequence(&self) -> u64 {
+        self.inner.sequence.load(Ordering::SeqCst)
+    }
+
+    /// Get CDC statistics
+    pub fn stats(&self) -> CdcStats {
+        CdcStats {
+            total_events: self.inner.stats.total_events.load(Ordering::Relaxed),
+            current_sequence: self.current_sequence(),
+            replay_buffer_size: self.inner.replay_buffer.len(),
+            active_subscriptions: self.inner.stats.active_subscriptions.load(Ordering::Relaxed),
+            events_dropped: self.inner.stats.events_dropped.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Background processor thread
+fn cdc_processor_loop(inner: Arc<CdcLogInner>) {
+    while let Ok(event) = inner.receiver.recv() {
+        // Add to replay buffer (lock-free)
+        if inner.replay_buffer.force_push(event.clone()).is_err() {
+            // Oldest event evicted
+            inner.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Broadcast to subscribers
+        let _ = inner.broadcast_tx.send(event);
+
+        // Update stats
+        inner.stats.total_events.fetch_add(1, Ordering::Relaxed);
+
+        // Phase 2: Write to WAL
+        // if let Some(ref wal) = inner.wal_writer {
+        //     wal.append(&event)?;
+        // }
+    }
+}
+
+/// Subscription handle
+pub struct CdcSubscription {
+    receiver: broadcast::Receiver<ChangeEvent>,
+    filter: SubscriptionFilter,
+}
+
+impl CdcSubscription {
+    /// Receive next event (blocking, with filtering)
+    pub async fn recv(&mut self) -> Result<ChangeEvent, CdcError> {
+        loop {
+            let event = self.receiver.recv().await
+                .map_err(|_| CdcError::SubscriptionLagged)?;
+
+            // Apply filters
+            if let Some(ref actor_type) = self.filter.actor_type {
+                if &event.actor_type != actor_type {
+                    continue;
+                }
+            }
+
+            if let Some(ref prefix) = self.filter.key_prefix {
+                if !event.actor_id.starts_with(prefix) {
+                    continue;
+                }
+            }
+
+            return Ok(event);
+        }
+    }
+}
+
+struct SubscriptionFilter {
+    actor_type: Option<String>,
+    key_prefix: Option<String>,
+}
+
+pub struct SubscriptionOptions {
+    pub start_position: StartPosition,
+    pub actor_type_filter: Option<String>,
+    pub key_prefix_filter: Option<String>,
+}
+
+pub enum StartPosition {
+    Beginning,
+    SequenceNumber(u64),
+    Now,
+    Timestamp(DateTime<Utc>),  // Phase 2
+}
+
+pub struct CdcStats {
+    pub total_events: u64,
+    pub current_sequence: u64,
+    pub replay_buffer_size: usize,
+    pub active_subscriptions: usize,
+    pub events_dropped: u64,
+}
+
+struct AtomicStats {
+    total_events: AtomicU64,
+    events_dropped: AtomicU64,
+    active_subscriptions: AtomicUsize,
+}
+```
+
+---
+
 ## API Specification
 
 ### Core CRUD Operations
 
+All operations are exposed through `ActorStoreClient` and require an `actor_type` parameter (equivalent to collection/table name in traditional databases).
+
 #### 1. Insert
 
-Creates a new ActorData entry with auto-generated version 1.
+Creates a new ActorData entry with auto-generated version 0.
 
 ```rust
-fn insert(&mut self, id: String, value: serde_json::Value) -> Result<ActorData, InsertError>
+pub fn insert(
+    &self,
+    actor_type: impl Into<String>,
+    id: impl Into<String>,
+    value: Value,
+) -> Result<ActorData, InsertError>
 ```
 
 **Parameters**:
-- `id`: Unique string identifier for the actor
+- `actor_type`: The actor type namespace (e.g., "users", "accounts")
+- `id`: Unique string identifier for the actor within its type
 - `value`: JSON value to store
 
 **Returns**:
-- `Ok(ActorData)`: The created entry with `version = 1`
-- `Err(InsertError::KeyAlreadyExists)`: If key already exists
+- `Ok(ActorData)`: The created entry with `version = 0`
+- `Err(InsertError::KeyAlreadyExists)`: If key already exists in the actor type
 - `Err(InsertError::InvalidKey)`: If key is empty or invalid
 - `Err(InsertError::ValueTooLarge)`: If value exceeds size limit
 
 **Behavior**:
-- Fails if key already exists (use update to modify existing)
-- Automatically sets version to 1
+- Fails if key already exists within the actor type (use update to modify existing)
+- Automatically sets version to 0
 - Generates CDC event with operation type "INSERT"
+- Thread-safe, can be called concurrently from multiple threads
 
 **Example**:
 ```rust
-let data = store.insert(
-    "user:alice".to_string(),
+let client = ActorStoreClient::new(store);
+let data = client.insert(
+    "users",
+    "user:alice",
     json!({"name": "Alice", "balance": 100})
 )?;
-assert_eq!(data.version, 1);
+assert_eq!(data.version, 0);
 ```
 
 ---
 
 #### 2. Get
 
-Retrieves an ActorData by its key.
+Retrieves an ActorData by its type and key.
 
 ```rust
-fn get(&self, id: &str) -> Option<ActorData>
+pub fn get(
+    &self,
+    actor_type: impl Into<String>,
+    id: impl AsRef<str>,
+) -> Option<ActorData>
 ```
 
 **Parameters**:
-- `id`: String key to lookup
+- `actor_type`: The actor type namespace
+- `id`: String key to lookup within the actor type
 
 **Returns**:
-- `Some(ActorData)`: If key exists
+- `Some(ActorData)`: If key exists in the specified actor type
 - `None`: If key does not exist
 
 **Behavior**:
 - Read-only operation (no side effects)
 - Returns a clone of the stored data
-- O(1) lookup time
+- O(1) lookup time within actor type
+- Thread-safe, linearizable reads
 
 **Example**:
 ```rust
-if let Some(data) = store.get("user:alice") {
+if let Some(data) = client.get("users", "user:alice") {
     println!("Found: {} at version {}", data.id, data.version);
 }
 ```
@@ -187,30 +829,38 @@ if let Some(data) = store.get("user:alice") {
 Updates an existing ActorData, incrementing its version.
 
 ```rust
-fn update(&mut self, id: &str, value: serde_json::Value) -> Result<ActorData, UpdateError>
+pub fn update(
+    &self,
+    actor_type: impl Into<String>,
+    id: impl AsRef<str>,
+    value: Value,
+) -> Result<ActorData, UpdateError>
 ```
 
 **Parameters**:
-- `id`: Key of the actor to update
+- `actor_type`: The actor type namespace
+- `id`: Key of the actor to update within its type
 - `value`: New JSON value
 
 **Returns**:
 - `Ok(ActorData)`: Updated entry with incremented version
-- `Err(UpdateError::NotFound)`: If key does not exist
+- `Err(UpdateError::NotFound)`: If key does not exist in the actor type
 
 **Behavior**:
 - Fails if key doesn't exist (use insert to create)
 - Increments version by 1
 - Replaces entire value (not partial update)
 - Generates CDC event with operation type "UPDATE"
+- Thread-safe via interior mutability
 
 **Example**:
 ```rust
-let updated = store.update(
+let updated = client.update(
+    "users",
     "user:alice",
     json!({"name": "Alice", "balance": 150})
 )?;
-assert_eq!(updated.version, 2); // Incremented from 1
+assert_eq!(updated.version, 1); // Incremented from 0
 ```
 
 ---
@@ -220,16 +870,18 @@ assert_eq!(updated.version, 2); // Incremented from 1
 Updates only if the current version matches the expected version.
 
 ```rust
-fn update_versioned(
-    &mut self,
-    id: &str,
-    value: serde_json::Value,
-    expected_version: u64
+pub fn update_versioned(
+    &self,
+    actor_type: impl Into<String>,
+    id: impl AsRef<str>,
+    value: Value,
+    expected_version: u64,
 ) -> Result<ActorData, UpdateVersionedError>
 ```
 
 **Parameters**:
-- `id`: Key of the actor to update
+- `actor_type`: The actor type namespace
+- `id`: Key of the actor to update within its type
 - `value`: New JSON value
 - `expected_version`: Version number expected to be current
 
@@ -248,11 +900,12 @@ fn update_versioned(
 **Example**:
 ```rust
 // Read current version
-let current = store.get("user:alice").unwrap();
+let current = client.get("users", "user:alice").unwrap();
 assert_eq!(current.version, 5);
 
 // Update only if version is still 5
-let updated = store.update_versioned(
+let updated = client.update_versioned(
+    "users",
     "user:alice",
     json!({"name": "Alice", "balance": 200}),
     5
@@ -266,14 +919,19 @@ assert_eq!(updated.version, 6);
 
 #### 5. Delete
 
-Removes an ActorData entry.
+Removes an ActorData entry from the specified actor type.
 
 ```rust
-fn delete(&mut self, id: &str) -> Option<ActorData>
+pub fn delete(
+    &self,
+    actor_type: impl Into<String>,
+    id: impl AsRef<str>,
+) -> Option<ActorData>
 ```
 
 **Parameters**:
-- `id`: Key of the actor to delete
+- `actor_type`: The actor type namespace
+- `id`: Key of the actor to delete within its type
 
 **Returns**:
 - `Some(ActorData)`: The deleted entry (for audit/rollback)
@@ -283,10 +941,11 @@ fn delete(&mut self, id: &str) -> Option<ActorData>
 - Returns the deleted entry before removal
 - Generates CDC event with operation type "DELETE"
 - Idempotent (deleting non-existent key returns None)
+- Thread-safe
 
 **Example**:
 ```rust
-if let Some(deleted) = store.delete("user:alice") {
+if let Some(deleted) = client.delete("users", "user:alice") {
     println!("Deleted user at version {}", deleted.version);
 }
 ```
@@ -295,25 +954,28 @@ if let Some(deleted) = store.delete("user:alice") {
 
 #### 6. Get All
 
-Retrieves all ActorData entries in the store.
+Retrieves all ActorData entries for a specific actor type.
 
 ```rust
-fn get_all(&self) -> Vec<ActorData>
+pub fn get_all(&self, actor_type: impl Into<String>) -> Vec<ActorData>
 ```
 
+**Parameters**:
+- `actor_type`: The actor type namespace to query
+
 **Returns**:
-- Vector of all ActorData entries (unordered)
+- Vector of all ActorData entries for the specified type (unordered)
 
 **Behavior**:
-- Returns clones of all entries
+- Returns clones of all entries in the actor type
 - Order is not guaranteed
-- Can be expensive for large stores
+- Can be expensive for large actor types
 - Use for debugging, backups, or small datasets
 
 **Example**:
 ```rust
-let all_actors = store.get_all();
-println!("Total actors: {}", all_actors.len());
+let all_users = client.get_all("users");
+println!("Total users: {}", all_users.len());
 ```
 
 ---
@@ -450,38 +1112,62 @@ let receiver = store.subscribe(SubscriptionOptions {
 
 #### Implementation Details
 
-**Storage Engine**:
+**Three-Component Architecture**:
+
 ```rust
 use dashmap::DashMap;
 use std::sync::Arc;
 
-pub struct InMemoryStore {
-    // Concurrent hash map for actor storage
-    data: DashMap<String, ActorData>,
+// Component 1: Client (Public API)
+pub struct ActorStoreClient {
+    store: Arc<ActorStore>,
+}
 
-    // Change event log
-    change_log: Arc<RwLock<Vec<ChangeEvent>>>,
+// Component 2: Storage Handler
+pub struct ActorStore {
+    // Nested DashMap: actor_type -> (actor_id -> ActorData)
+    data: DashMap<String, DashMap<String, ActorData>>,
 
-    // Sequence counter for CDC
-    sequence_counter: AtomicU64,
+    // CDC writer handle (lock-free, cloneable)
+    cdc_writer: CdcWriter,
+}
 
-    // Event broadcast channel
-    event_sender: broadcast::Sender<ChangeEvent>,
+// Component 3: CDC Module
+pub struct CdcWriter {
+    sender: Sender<ChangeEvent>,
+    sequence: Arc<AtomicU64>,
+}
+
+pub struct CdcLog {
+    inner: Arc<CdcLogInner>,
+    processor_handle: Option<JoinHandle<()>>,
+}
+
+struct CdcLogInner {
+    sequence: Arc<AtomicU64>,
+    receiver: Receiver<ChangeEvent>,
+    replay_buffer: ArrayQueue<ChangeEvent>,
+    broadcast_tx: broadcast::Sender<ChangeEvent>,
+    config: CdcConfig,
 }
 ```
 
 **Key Decisions**:
-- Use `DashMap` for lock-free concurrent access
-- Use `broadcast` channel for event distribution to subscribers
-- Store change log in memory (bounded by retention settings)
-- No persistence (data lost on restart)
+- **Nested DashMap**: Outer map for actor types, inner map for actor IDs - enables zero-contention concurrent access across different actor types
+- **Lock-Free CDC**: Pre-allocated sequence numbers using `AtomicU64::fetch_add` with background processing
+- **Interior Mutability**: Client uses `&self` (not `&mut self`), relying on DashMap's internal locking
+- **mpsc-like CDC Pattern**: CdcWriter sends to channel, CdcLog processes events in background thread
+- **Cloneable Writer**: Multiple components can hold CdcWriter handles without Arc wrapping
+- In-memory only (data and CDC log lost on restart)
 
 **Deliverables**:
-- `src/store/mod.rs`: Main store trait
-- `src/store/memory.rs`: In-memory implementation
-- `src/types.rs`: Data types (ActorData, ChangeEvent, etc.)
-- `src/error.rs`: Error types
-- `tests/memory_store_tests.rs`: Basic functionality tests
+- `src/client.rs`: ActorStoreClient (public API)
+- `src/store.rs`: ActorStore (internal handler)
+- `src/cdc/mod.rs`: CDC module (writer, log, subscriptions)
+- `src/types.rs`: Data types (ActorData, ChangeEvent, UnsequencedEvent, etc.)
+- `src/error.rs`: Error types (InsertError, UpdateError, CdcError, etc.)
+- `tests/client_tests.rs`: Client API tests
+- `tests/cdc_tests.rs`: Change data capture tests
 
 ---
 
@@ -507,13 +1193,13 @@ pub struct InMemoryStore {
 **Storage Backends**:
 ```rust
 pub trait StorageBackend: Send + Sync {
-    fn insert(&mut self, id: String, value: Value) -> Result<ActorData>;
-    fn get(&self, id: &str) -> Option<ActorData>;
-    fn update(&mut self, id: &str, value: Value) -> Result<ActorData>;
-    fn delete(&mut self, id: &str) -> Option<ActorData>;
-    fn get_all(&self) -> Vec<ActorData>;
+    fn insert(&self, actor_type: String, id: String, value: Value) -> Result<ActorData>;
+    fn get(&self, actor_type: &str, id: &str) -> Option<ActorData>;
+    fn update(&self, actor_type: &str, id: &str, value: Value) -> Result<ActorData>;
+    fn delete(&self, actor_type: &str, id: &str) -> Option<ActorData>;
+    fn get_all(&self, actor_type: &str) -> Vec<ActorData>;
     fn snapshot(&self) -> Result<Snapshot>;
-    fn restore(&mut self, snapshot: Snapshot) -> Result<()>;
+    fn restore(&self, snapshot: Snapshot) -> Result<()>;
 }
 
 pub struct RocksDBBackend {
@@ -590,25 +1276,25 @@ pub struct RocksDBBackend {
 **When**:
 ```rust
 // Insert a new actor
-let actor = store.insert("user:1", json!({"name": "Alice"}))?;
+let actor = client.insert("users", "user:1", json!({"name": "Alice"}))?;
 
 // Read it back
-let retrieved = store.get("user:1").unwrap();
+let retrieved = client.get("users", "user:1").unwrap();
 
 // Update it
-let updated = store.update("user:1", json!({"name": "Alice", "age": 30}))?;
+let updated = client.update("users", "user:1", json!({"name": "Alice", "age": 30}))?;
 
 // Delete it
-let deleted = store.delete("user:1").unwrap();
+let deleted = client.delete("users", "user:1").unwrap();
 
 // Verify deletion
-let not_found = store.get("user:1");
+let not_found = client.get("users", "user:1");
 ```
 
 **Then**:
-- Insert returns ActorData with version = 1
+- Insert returns ActorData with version = 0
 - Get returns same data
-- Update returns ActorData with version = 2
+- Update returns ActorData with version = 1
 - Delete returns the last state before deletion
 - Final get returns None
 
@@ -621,18 +1307,18 @@ let not_found = store.get("user:1");
 **When**:
 ```rust
 // Client A reads actor
-let actor_a = store.get("user:1").unwrap();
+let actor_a = client.get("users", "user:1").unwrap();
 assert_eq!(actor_a.version, 5);
 
 // Client B reads actor
-let actor_b = store.get("user:1").unwrap();
+let actor_b = client.get("users", "user:1").unwrap();
 assert_eq!(actor_b.version, 5);
 
 // Client A updates
-store.update_versioned("user:1", json!({"balance": 100}), 5)?;
+client.update_versioned("users", "user:1", json!({"balance": 100}), 5)?;
 
 // Client B tries to update with stale version
-let result = store.update_versioned("user:1", json!({"balance": 200}), 5);
+let result = client.update_versioned("users", "user:1", json!({"balance": 200}), 5);
 ```
 
 **Then**:
@@ -649,9 +1335,10 @@ let result = store.update_versioned("user:1", json!({"balance": 200}), 5);
 **When**:
 ```rust
 // Subscribe from beginning
-let mut receiver = store.subscribe(SubscriptionOptions {
+let mut receiver = client.subscribe(SubscriptionOptions {
     start_position: StartPosition::Beginning,
-    key_prefix: None,
+    actor_type_filter: None,
+    key_prefix_filter: None,
 });
 
 // Should receive 3 INSERT events for existing actors
@@ -660,15 +1347,15 @@ let event2 = receiver.recv().await.unwrap();
 let event3 = receiver.recv().await.unwrap();
 
 // Insert a new actor
-store.insert("user:4", json!({"name": "Bob"}))?;
+client.insert("users", "user:4", json!({"name": "Bob"}))?;
 
 // Should receive INSERT event for new actor
 let event4 = receiver.recv().await.unwrap();
 ```
 
 **Then**:
-- First 3 events are INSERTs with sequences 1, 2, 3
-- Fourth event is INSERT with sequence 4
+- First 3 events are INSERTs with sequences 0, 1, 2
+- Fourth event is INSERT with sequence 3
 - All events arrive in order
 - Subscriber continues receiving future changes
 
@@ -684,9 +1371,10 @@ let event4 = receiver.recv().await.unwrap();
 save_checkpoint(100);
 
 // Subscriber restarts and resumes
-let receiver = store.subscribe(SubscriptionOptions {
+let receiver = client.subscribe(SubscriptionOptions {
     start_position: StartPosition::SequenceNumber(100),
-    key_prefix: None,
+    actor_type_filter: None,
+    key_prefix_filter: None,
 });
 
 // Should receive events starting from sequence 101
@@ -708,14 +1396,15 @@ assert_eq!(event.sequence, 101);
 **When**:
 ```rust
 // Subscribe only to user changes
-let receiver = store.subscribe(SubscriptionOptions {
+let receiver = client.subscribe(SubscriptionOptions {
     start_position: StartPosition::Now,
-    key_prefix: Some("user:".to_string()),
+    actor_type_filter: None,
+    key_prefix_filter: Some("user:".to_string()),
 });
 
 // Insert user and order
-store.insert("user:5", json!({"name": "Charlie"}))?;
-store.insert("order:100", json!({"total": 50.0}))?;
+client.insert("users", "user:5", json!({"name": "Charlie"}))?;
+client.insert("orders", "order:100", json!({"total": 50.0}))?;
 
 // Receive events
 let event = receiver.recv().await.unwrap();
@@ -730,11 +1419,11 @@ let event = receiver.recv().await.unwrap();
 
 ### Scenario 6: Get All Actors
 
-**Given**: Store contains 5 actors
+**Given**: Store contains 5 users
 
 **When**:
 ```rust
-let all = store.get_all();
+let all = client.get_all("users");
 ```
 
 **Then**:
@@ -751,18 +1440,19 @@ let all = store.get_all();
 **When**:
 ```rust
 // Insert initial actor
-store.insert("counter", json!({"count": 0}))?;
+client.insert("counters", "counter", json!({"count": 0}))?;
 
 // Spawn 100 threads, each incrementing counter
 let handles: Vec<_> = (0..100)
     .map(|_| {
-        let store = store.clone();
+        let client = client.clone();
         thread::spawn(move || {
             loop {
-                let current = store.get("counter").unwrap();
+                let current = client.get("counters", "counter").unwrap();
                 let new_count = current.value["count"].as_i64().unwrap() + 1;
 
-                match store.update_versioned(
+                match client.update_versioned(
+                    "counters",
                     "counter",
                     json!({"count": new_count}),
                     current.version
@@ -781,7 +1471,7 @@ for handle in handles {
 }
 
 // Check final count
-let final_count = store.get("counter").unwrap();
+let final_count = client.get("counters", "counter").unwrap();
 ```
 
 **Then**:
@@ -2011,20 +2701,28 @@ pub enum UpdateVersionedError {
     VersionMismatch { expected: u64, actual: u64 },
     ValueTooLarge,
 }
+
+pub enum CdcError {
+    // Unit enum - specific error variants will be added during implementation
+    // Potential future variants:
+    // - ChannelDisconnected
+    // - SubscriptionLagged
+    // - BufferOverflow
+    // - InvalidSequenceNumber
+}
 ```
 
 ### Store Trait
 
 ```rust
 pub trait ActorStore: Send + Sync {
-    fn insert(&mut self, id: String, value: Value) -> Result<ActorData, InsertError>;
-    fn get(&self, id: &str) -> Option<ActorData>;
-    fn update(&mut self, id: &str, value: Value) -> Result<ActorData, UpdateError>;
-    fn update_versioned(&mut self, id: &str, value: Value, expected_version: u64)
+    fn insert(&self, actor_type: String, id: String, value: Value) -> Result<ActorData, InsertError>;
+    fn get(&self, actor_type: String, id: &str) -> Option<ActorData>;
+    fn update(&self, actor_type: String, id: &str, value: Value) -> Result<ActorData, UpdateError>;
+    fn update_versioned(&self, actor_type: String, id: &str, value: Value, expected_version: u64)
         -> Result<ActorData, UpdateVersionedError>;
-    fn delete(&mut self, id: &str) -> Option<ActorData>;
-    fn get_all(&self) -> Vec<ActorData>;
-    fn subscribe(&self, options: SubscriptionOptions) -> ChangeStreamReceiver;
+    fn delete(&self, actor_type: String, id: &str) -> Option<ActorData>;
+    fn get_all(&self, actor_type: String) -> Vec<ActorData>;
 }
 ```
 
