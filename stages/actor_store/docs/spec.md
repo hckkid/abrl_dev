@@ -170,127 +170,66 @@ Separate module responsible for event sequencing, storage, and distribution.
 
 ---
 
-## Detailed Component Design
+## Component API Signatures
+
+> **Note**: For detailed implementation code and examples, see [implementation-details.md](implementation-details.md).
 
 ### Component 1: ActorStoreClient (Public API)
 
-```rust
-use serde_json::Value;
-use std::sync::Arc;
+**Purpose**: Thread-safe client for application-level Actor Store operations.
 
-/// Public-facing client for Actor Store operations
+**Type Definition**:
+```rust
 #[derive(Clone)]
 pub struct ActorStoreClient {
     store: Arc<ActorStore>,
     cdc_log: Arc<CdcLog>,
 }
+```
 
-impl ActorStoreClient {
-    /// Create a new client with default configuration
-    pub fn new() -> Self {
-        Self::with_config(ActorStoreConfig::default())
-    }
+**Constructor Methods**:
 
-    /// Create a new client with custom configuration
-    pub fn with_config(config: ActorStoreConfig) -> Self {
-        let (cdc_writer, cdc_log) = create_cdc_log(config.cdc_config);
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `new` | `pub fn new() -> Self` | Creates client with default configuration |
+| `with_config` | `pub fn with_config(config: ActorStoreConfig) -> Self` | Creates client with custom CDC and storage configuration |
 
-        let store = Arc::new(ActorStore {
-            data: DashMap::new(),
-            cdc_writer,
-        });
+**CRUD Operations**:
 
-        Self {
-            store,
-            cdc_log: Arc::new(cdc_log),
-        }
-    }
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `insert` | `pub fn insert(&self, actor_type: impl Into<String>, id: impl Into<String>, value: Value) -> Result<ActorData, InsertError>` | Inserts new actor with version 0. Fails if key already exists. |
+| `get` | `pub fn get(&self, actor_type: impl Into<String>, id: &str) -> Option<ActorData>` | Retrieves actor by type and ID. Returns None if not found. |
+| `update` | `pub fn update(&self, actor_type: impl Into<String>, id: &str, value: Value) -> Result<ActorData, UpdateError>` | Updates existing actor, incrementing version by 1. Fails if not found. |
+| `update_versioned` | `pub fn update_versioned(&self, actor_type: impl Into<String>, id: &str, value: Value, expected_version: u64) -> Result<ActorData, UpdateVersionedError>` | Compare-and-swap update. Only succeeds if current version matches expected. |
+| `delete` | `pub fn delete(&self, actor_type: impl Into<String>, id: &str) -> Option<ActorData>` | Removes actor. Returns deleted ActorData if existed. |
+| `get_all` | `pub fn get_all(&self, actor_type: impl Into<String>) -> Vec<ActorData>` | Returns all actors of specified type in arbitrary order. |
 
-    /// Insert a new actor
-    pub fn insert(
-        &self,
-        actor_type: impl Into<String>,
-        id: impl Into<String>,
-        value: Value,
-    ) -> Result<ActorData, InsertError> {
-        self.store.insert(actor_type.into(), id.into(), value)
-    }
+**CDC Operations**:
 
-    /// Get an actor by ID
-    pub fn get(
-        &self,
-        actor_type: impl Into<String>,
-        id: &str,
-    ) -> Option<ActorData> {
-        self.store.get(actor_type.into(), id)
-    }
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `subscribe` | `pub fn subscribe(&self, options: SubscriptionOptions) -> Result<CdcSubscription, CdcError>` | Creates subscription to change events with optional filtering. |
+| `cdc_stats` | `pub fn cdc_stats(&self) -> CdcStats` | Returns current CDC metrics (sequence, buffer size, subscribers). |
 
-    /// Update an existing actor
-    pub fn update(
-        &self,
-        actor_type: impl Into<String>,
-        id: &str,
-        value: Value,
-    ) -> Result<ActorData, UpdateError> {
-        self.store.update(actor_type.into(), id, value)
-    }
-
-    /// Update with version check (compare-and-swap)
-    pub fn update_versioned(
-        &self,
-        actor_type: impl Into<String>,
-        id: &str,
-        value: Value,
-        expected_version: u64,
-    ) -> Result<ActorData, UpdateVersionedError> {
-        self.store.update_versioned(actor_type.into(), id, value, expected_version)
-    }
-
-    /// Delete an actor
-    pub fn delete(
-        &self,
-        actor_type: impl Into<String>,
-        id: &str,
-    ) -> Option<ActorData> {
-        self.store.delete(actor_type.into(), id)
-    }
-
-    /// Get all actors of a specific type
-    pub fn get_all(
-        &self,
-        actor_type: impl Into<String>,
-    ) -> Vec<ActorData> {
-        self.store.get_all(actor_type.into())
-    }
-
-    /// Subscribe to change events
-    pub fn subscribe(
-        &self,
-        options: SubscriptionOptions,
-    ) -> Result<CdcSubscription, CdcError> {
-        self.cdc_log.subscribe(options)
-    }
-
-    /// Get CDC statistics
-    pub fn cdc_stats(&self) -> CdcStats {
-        self.cdc_log.stats()
-    }
-}
-
+**Configuration**:
+```rust
 pub struct ActorStoreConfig {
     pub cdc_config: CdcConfig,
     // Future: persistence config, cluster config, etc.
 }
 ```
 
+**See also**: [ActorStoreClient Implementation](implementation-details.md#actorstorecllient-implementation)
+
 ---
 
-### Component 2: ActorStore (Server/Handler)
+### Component 2: ActorStore (Internal Storage Handler)
 
+**Purpose**: Internal storage engine with nested DashMap architecture and integrated CDC publishing.
+
+**Type Definition**:
 ```rust
-use dashmap::DashMap;
-
-/// Internal storage handler with nested DashMap architecture
 pub struct ActorStore {
     // actor_type -> (actor_id -> ActorData)
     data: DashMap<String, DashMap<String, ActorData>>,
@@ -298,283 +237,92 @@ pub struct ActorStore {
     // CDC writer (lock-free, cloneable)
     cdc_writer: CdcWriter,
 }
-
-impl ActorStore {
-    /// Insert operation implementation
-    pub fn insert(
-        &self,
-        actor_type: String,
-        id: String,
-        value: Value,
-    ) -> Result<ActorData, InsertError> {
-        // Validate inputs
-        if id.is_empty() {
-            return Err(InsertError::InvalidKey);
-        }
-
-        // Create ActorData
-        let actor = ActorData {
-            id: id.clone(),
-            value: value.clone(),
-            version: 0,
-        };
-
-        // Get or create inner DashMap for actor type
-        let type_store = self.data
-            .entry(actor_type.clone())
-            .or_insert_with(DashMap::new);
-
-        // Attempt insert (fails if key exists)
-        if type_store.insert(id.clone(), actor.clone()).is_some() {
-            return Err(InsertError::KeyAlreadyExists);
-        }
-
-        // Publish CDC event (lock-free, returns sequence number)
-        let seq = self.cdc_writer.write(UnsequencedEvent {
-            operation: OperationType::INSERT,
-            actor_type,
-            actor_id: id,
-            previous_value: None,
-            previous_version: None,
-            new_value: Some(value),
-            new_version: Some(0),
-            timestamp: Utc::now(),
-        })?;
-
-        Ok(actor)
-    }
-
-    /// Get operation implementation
-    pub fn get(
-        &self,
-        actor_type: String,
-        id: &str,
-    ) -> Option<ActorData> {
-        self.data
-            .get(&actor_type)?
-            .get(id)
-            .map(|entry| entry.value().clone())
-    }
-
-    /// Update operation implementation
-    pub fn update(
-        &self,
-        actor_type: String,
-        id: &str,
-        value: Value,
-    ) -> Result<ActorData, UpdateError> {
-        let type_store = self.data
-            .get(&actor_type)
-            .ok_or(UpdateError::NotFound)?;
-
-        let mut entry = type_store
-            .get_mut(id)
-            .ok_or(UpdateError::NotFound)?;
-
-        let old_value = entry.value.clone();
-        let old_version = entry.version;
-
-        // Update in place
-        entry.value = value.clone();
-        entry.version += 1;
-
-        let updated = entry.clone();
-        drop(entry); // Release lock
-
-        // Publish CDC event
-        let seq = self.cdc_writer.write(UnsequencedEvent {
-            operation: OperationType::UPDATE,
-            actor_type,
-            actor_id: id.to_string(),
-            previous_value: Some(old_value),
-            previous_version: Some(old_version),
-            new_value: Some(value),
-            new_version: Some(updated.version),
-            timestamp: Utc::now(),
-        })?;
-
-        Ok(updated)
-    }
-
-    /// Update with version check implementation
-    pub fn update_versioned(
-        &self,
-        actor_type: String,
-        id: &str,
-        value: Value,
-        expected_version: u64,
-    ) -> Result<ActorData, UpdateVersionedError> {
-        let type_store = self.data
-            .get(&actor_type)
-            .ok_or(UpdateVersionedError::NotFound)?;
-
-        let mut entry = type_store
-            .get_mut(id)
-            .ok_or(UpdateVersionedError::NotFound)?;
-
-        // Version check
-        if entry.version != expected_version {
-            return Err(UpdateVersionedError::VersionMismatch {
-                expected: expected_version,
-                actual: entry.version,
-            });
-        }
-
-        let old_value = entry.value.clone();
-        let old_version = entry.version;
-
-        // Update in place
-        entry.value = value.clone();
-        entry.version += 1;
-
-        let updated = entry.clone();
-        drop(entry); // Release lock
-
-        // Publish CDC event
-        let seq = self.cdc_writer.write(UnsequencedEvent {
-            operation: OperationType::UPDATE,
-            actor_type,
-            actor_id: id.to_string(),
-            previous_value: Some(old_value),
-            previous_version: Some(old_version),
-            new_value: Some(value),
-            new_version: Some(updated.version),
-            timestamp: Utc::now(),
-        })?;
-
-        Ok(updated)
-    }
-
-    /// Delete operation implementation
-    pub fn delete(
-        &self,
-        actor_type: String,
-        id: &str,
-    ) -> Option<ActorData> {
-        let type_store = self.data.get(&actor_type)?;
-        let (_, deleted) = type_store.remove(id)?;
-
-        // Publish CDC event
-        let _ = self.cdc_writer.write(UnsequencedEvent {
-            operation: OperationType::DELETE,
-            actor_type,
-            actor_id: id.to_string(),
-            previous_value: Some(deleted.value.clone()),
-            previous_version: Some(deleted.version),
-            new_value: None,
-            new_version: None,
-            timestamp: Utc::now(),
-        });
-
-        Some(deleted)
-    }
-
-    /// Get all actors of a specific type
-    pub fn get_all(
-        &self,
-        actor_type: String,
-    ) -> Vec<ActorData> {
-        self.data
-            .get(&actor_type)
-            .map(|type_store| {
-                type_store.iter()
-                    .map(|entry| entry.value().clone())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-}
 ```
+
+**Storage Operations**:
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `insert` | `pub fn insert(&self, actor_type: String, id: String, value: Value) -> Result<ActorData, InsertError>` | Creates actor with version 0, publishes INSERT CDC event. Gets or creates inner DashMap for actor_type. Fails if key already exists. |
+| `get` | `pub fn get(&self, actor_type: String, id: &str) -> Option<ActorData>` | Retrieves actor from nested DashMap. Returns None if actor_type or actor_id not found. |
+| `update` | `pub fn update(&self, actor_type: String, id: &str, value: Value) -> Result<ActorData, UpdateError>` | Updates actor in-place, increments version by 1, publishes UPDATE CDC event with previous and new values. Acquires DashMap entry lock, modifies, then releases. |
+| `update_versioned` | `pub fn update_versioned(&self, actor_type: String, id: &str, value: Value, expected_version: u64) -> Result<ActorData, UpdateVersionedError>` | Compare-and-swap update. Checks current version matches expected before updating. Provides optimistic concurrency control for conflict detection. |
+| `delete` | `pub fn delete(&self, actor_type: String, id: &str) -> Option<ActorData>` | Removes actor from nested DashMap, publishes DELETE CDC event with previous value. Returns deleted ActorData if existed. |
+| `get_all` | `pub fn get_all(&self, actor_type: String) -> Vec<ActorData>` | Collects all actors of specified type. Iterates inner DashMap and clones all entries. Returns empty vector if actor_type not found. |
+
+**See also**: [ActorStore Implementation](implementation-details.md#actorstore-implementation)
 
 ---
 
-### Component 3: CDC Module
+### Component 3: CDC Module (Change Data Capture)
 
+**Purpose**: Separate module for event sequencing, storage, and distribution with lock-free publishing and subscription management.
+
+**Configuration**:
 ```rust
-use crossbeam::channel::{bounded, Sender, Receiver};
-use crossbeam::queue::ArrayQueue;
-use tokio::sync::broadcast;
-
-/// Configuration for CDC
 pub struct CdcConfig {
     pub replay_buffer_size: usize,      // e.g., 10_000
     pub channel_capacity: usize,        // e.g., 10_000
     pub subscriber_capacity: usize,     // e.g., 1_000
     pub persistence_path: Option<PathBuf>,  // Phase 2
 }
+```
 
-/// Creates a CDC log system (similar to mpsc::channel pattern)
-pub fn create_cdc_log(config: CdcConfig) -> (CdcWriter, CdcLog) {
-    let (sender, receiver) = bounded(config.channel_capacity);
-    let replay_buffer = ArrayQueue::new(config.replay_buffer_size);
-    let (broadcast_tx, _) = broadcast::channel(config.subscriber_capacity);
+**Factory Function**:
 
-    let sequence = Arc::new(AtomicU64::new(0));
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `create_cdc_log` | `pub fn create_cdc_log(config: CdcConfig) -> (CdcWriter, CdcLog)` | Creates CDC system similar to mpsc::channel pattern. Returns writer handle and log manager. Spawns background processor thread for event sequencing. |
 
-    let inner = Arc::new(CdcLogInner {
-        sequence: sequence.clone(),
-        receiver,
-        replay_buffer,
-        broadcast_tx: broadcast_tx.clone(),
-        config,
-        stats: Arc::new(AtomicStats::default()),
-    });
+**CdcWriter (Lock-Free Publisher)**:
 
-    // Spawn background processor
-    let inner_clone = inner.clone();
-    let processor_handle = std::thread::Builder::new()
-        .name("cdc-processor".to_string())
-        .spawn(move || cdc_processor_loop(inner_clone))
-        .expect("Failed to spawn CDC processor");
-
-    let writer = CdcWriter {
-        sender,
-        sequence,
-    };
-
-    let cdc_log = CdcLog {
-        inner,
-        processor_handle: Some(processor_handle),
-    };
-
-    (writer, cdc_log)
-}
-
-/// CdcWriter - Lightweight, cloneable handle for publishing events
+Type definition:
+```rust
 #[derive(Clone)]
 pub struct CdcWriter {
     sender: Sender<ChangeEvent>,
     sequence: Arc<AtomicU64>,
 }
+```
 
-impl CdcWriter {
-    /// Write an event (returns actual sequence number)
-    pub fn write(&self, event: UnsequencedEvent) -> Result<u64, CdcError> {
-        // Pre-allocate sequence number (lock-free, instant)
-        let seq = self.sequence.fetch_add(1, Ordering::SeqCst);
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `write` | `pub fn write(&self, event: UnsequencedEvent) -> Result<u64, CdcError>` | Pre-allocates sequence number using atomic fetch_add (lock-free). Creates sequenced event and enqueues for background processing. Returns assigned sequence number. |
 
-        // Create sequenced event
-        let sequenced = ChangeEvent {
-            sequence: seq,
-            operation: event.operation,
-            actor_type: event.actor_type,
-            actor_id: event.actor_id,
-            previous_value: event.previous_value,
-            previous_version: event.previous_version,
-            new_value: event.new_value,
-            new_version: event.new_version,
-            timestamp: event.timestamp,
-        };
+**CdcLog (Event Log Manager)**:
 
-        // Enqueue for background processing
-        self.sender.send(sequenced)
-            .map_err(|_| CdcError::Disconnected)?;
-
-        Ok(seq)
-    }
+Type definition:
+```rust
+pub struct CdcLog {
+    inner: Arc<CdcLogInner>,
+    processor_handle: Option<JoinHandle<()>>,
 }
+```
 
-/// Event before sequencing (created by ActorStore)
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `subscribe` | `pub fn subscribe(&self, options: SubscriptionOptions) -> Result<CdcSubscription, CdcError>` | Creates subscription with optional filtering (actor_type, key_prefix) and start position (Beginning, SequenceNumber, Now). Returns subscription handle for receiving events. |
+| `current_sequence` | `pub fn current_sequence(&self) -> u64` | Returns latest sequence number assigned. Thread-safe atomic read. |
+| `stats` | `pub fn stats(&self) -> CdcStats` | Returns CDC metrics: total events, current sequence, replay buffer size, active subscriptions, events dropped. |
+
+**CdcSubscription (Event Consumer)**:
+
+Type definition:
+```rust
+pub struct CdcSubscription {
+    receiver: broadcast::Receiver<ChangeEvent>,
+    filter: SubscriptionFilter,
+}
+```
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `recv` | `pub async fn recv(&mut self) -> Result<ChangeEvent, CdcError>` | Receives next event matching subscription filters. Async, blocking until event available. Applies actor_type and key_prefix filters before returning. |
+
+**Event Types**:
+
+```rust
+// Event before sequencing (created by ActorStore)
 pub struct UnsequencedEvent {
     pub operation: OperationType,
     pub actor_type: String,
@@ -586,7 +334,7 @@ pub struct UnsequencedEvent {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Sequenced event (after CDC processing)
+// Sequenced event (after CDC processing)
 pub struct ChangeEvent {
     pub sequence: u64,  // Assigned before enqueue
     pub operation: OperationType,
@@ -598,119 +346,11 @@ pub struct ChangeEvent {
     pub new_version: Option<u64>,
     pub timestamp: DateTime<Utc>,
 }
+```
 
-/// CdcLog - Manages subscriptions and event log
-pub struct CdcLog {
-    inner: Arc<CdcLogInner>,
-    processor_handle: Option<JoinHandle<()>>,
-}
+**Supporting Types**:
 
-struct CdcLogInner {
-    sequence: Arc<AtomicU64>,
-    receiver: Receiver<ChangeEvent>,
-    replay_buffer: ArrayQueue<ChangeEvent>,
-    broadcast_tx: broadcast::Sender<ChangeEvent>,
-    config: CdcConfig,
-    stats: Arc<AtomicStats>,
-}
-
-impl CdcLog {
-    /// Subscribe to change events
-    pub fn subscribe(
-        &self,
-        options: SubscriptionOptions,
-    ) -> Result<CdcSubscription, CdcError> {
-        let receiver = self.inner.broadcast_tx.subscribe();
-
-        // TODO: Handle replay for Beginning/SequenceNumber positions
-
-        self.inner.stats.active_subscriptions
-            .fetch_add(1, Ordering::Relaxed);
-
-        Ok(CdcSubscription {
-            receiver,
-            filter: SubscriptionFilter {
-                actor_type: options.actor_type_filter,
-                key_prefix: options.key_prefix_filter,
-            },
-        })
-    }
-
-    /// Get current sequence number
-    pub fn current_sequence(&self) -> u64 {
-        self.inner.sequence.load(Ordering::SeqCst)
-    }
-
-    /// Get CDC statistics
-    pub fn stats(&self) -> CdcStats {
-        CdcStats {
-            total_events: self.inner.stats.total_events.load(Ordering::Relaxed),
-            current_sequence: self.current_sequence(),
-            replay_buffer_size: self.inner.replay_buffer.len(),
-            active_subscriptions: self.inner.stats.active_subscriptions.load(Ordering::Relaxed),
-            events_dropped: self.inner.stats.events_dropped.load(Ordering::Relaxed),
-        }
-    }
-}
-
-/// Background processor thread
-fn cdc_processor_loop(inner: Arc<CdcLogInner>) {
-    while let Ok(event) = inner.receiver.recv() {
-        // Add to replay buffer (lock-free)
-        if inner.replay_buffer.force_push(event.clone()).is_err() {
-            // Oldest event evicted
-            inner.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
-        }
-
-        // Broadcast to subscribers
-        let _ = inner.broadcast_tx.send(event);
-
-        // Update stats
-        inner.stats.total_events.fetch_add(1, Ordering::Relaxed);
-
-        // Phase 2: Write to WAL
-        // if let Some(ref wal) = inner.wal_writer {
-        //     wal.append(&event)?;
-        // }
-    }
-}
-
-/// Subscription handle
-pub struct CdcSubscription {
-    receiver: broadcast::Receiver<ChangeEvent>,
-    filter: SubscriptionFilter,
-}
-
-impl CdcSubscription {
-    /// Receive next event (blocking, with filtering)
-    pub async fn recv(&mut self) -> Result<ChangeEvent, CdcError> {
-        loop {
-            let event = self.receiver.recv().await
-                .map_err(|_| CdcError::SubscriptionLagged)?;
-
-            // Apply filters
-            if let Some(ref actor_type) = self.filter.actor_type {
-                if &event.actor_type != actor_type {
-                    continue;
-                }
-            }
-
-            if let Some(ref prefix) = self.filter.key_prefix {
-                if !event.actor_id.starts_with(prefix) {
-                    continue;
-                }
-            }
-
-            return Ok(event);
-        }
-    }
-}
-
-struct SubscriptionFilter {
-    actor_type: Option<String>,
-    key_prefix: Option<String>,
-}
-
+```rust
 pub struct SubscriptionOptions {
     pub start_position: StartPosition,
     pub actor_type_filter: Option<String>,
@@ -731,13 +371,9 @@ pub struct CdcStats {
     pub active_subscriptions: usize,
     pub events_dropped: u64,
 }
-
-struct AtomicStats {
-    total_events: AtomicU64,
-    events_dropped: AtomicU64,
-    active_subscriptions: AtomicUsize,
-}
 ```
+
+**See also**: [CDC Module Implementation](implementation-details.md#cdc-module-implementation)
 
 ---
 
