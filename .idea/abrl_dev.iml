@@ -5,6 +5,7 @@
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/stages/abrl_minimal/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/stages/actor_store/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/stages/actor_store_minimal/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />
